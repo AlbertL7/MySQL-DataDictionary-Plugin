@@ -40,12 +40,11 @@ A powerful MySQL Workbench plugin that automatically generates beautiful, intera
 - Mobile-friendly layout
 
 ## 📸 Screenshots
+<img width="1923" height="1461" alt="image" src="https://github.com/user-attachments/assets/b0088409-92d3-4d71-856a-bc92549223e0" />
+<img width="1811" height="1289" alt="image" src="https://github.com/user-attachments/assets/3b4a0001-2063-495a-acc5-05d65e277210" />
+<img width="1795" height="1351" alt="image" src="https://github.com/user-attachments/assets/b4ca61c6-22fd-4098-ba31-bf7163db58c8" />
 
-*Add your screenshots here showing:*
-- ERD diagram example
-- Search functionality
-- Table detail view
-- Filter options
+
 
 ## 🚀 Installation
 
