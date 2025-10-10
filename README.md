@@ -80,7 +80,7 @@ A powerful MySQL Workbench plugin that automatically generates beautiful, intera
 ### Basic Usage
 
 1. Open your database in MySQL Workbench
-2. Navigate to **Tools** → **Utilities** → **Generate Data Dictionary with ERD**
+2. Navigate to **Tools** → **Catalog** → **Generate Data Dictionary with ERD**
 3. Configure your preferences:
    - Enable/disable ERD diagram
    - Choose layout type (Hierarchical or Force-Directed)
@@ -121,7 +121,7 @@ A powerful MySQL Workbench plugin that automatically generates beautiful, intera
 ### Key Features Implementation
 
 #### Collision Detection Algorithm
-The plugin uses a sophisticated multi-pass algorithm to prevent FK label overlaps:
+The plugin uses a sophisticated multi-pass algorithm to prevent FK label overlaps (May miss some fk labels in the ERD):
 1. **Pass 1**: Calculate all relationship data and initial positions
 2. **Pass 2**: Try 14+ different positions for each label to find collision-free placement
 3. **Pass 3**: Render all relationships with optimized label positions
