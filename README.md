@@ -179,12 +179,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Inspired by the need for better database documentation tools
 - Thanks to the open-source community for continuous inspiration
 
-## 📞 Support
-
-- **Issues**: [GitHub Issues](https://github.com/yourusername/mysql-data-dictionary-erd/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/mysql-data-dictionary-erd/discussions)
-- **Email**: your.email@example.com
-
 ## 🌟 Show Your Support
 
 If this plugin helped you, please consider:
