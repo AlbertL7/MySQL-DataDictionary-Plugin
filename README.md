@@ -56,24 +56,19 @@ A powerful MySQL Workbench plugin that automatically generates beautiful, intera
 
 1. **Download the plugin**
    ```bash
-   git clone https://github.com/yourusername/mysql-data-dictionary-erd.git
+   git clone https://github.com/AlbertL7/DataDictionaryDump.git
    ```
+   - Or you can copy the code and save it as a ".py" file.
 
-2. **Locate MySQL Workbench plugins folder**
-   - **Windows**: `%AppData%\MySQL\Workbench\scripts\`
-   - **macOS**: `~/Library/Application Support/MySQL/Workbench/scripts/`
-   - **Linux**: `~/.mysql/workbench/scripts/`
-
-3. **Copy the plugin file**
-   ```bash
-   cp DataDictionarydump_COMPLETE.py [MySQL Workbench scripts folder]
-   ```
+2. **Open MySQL Workbench**
+  - Go to the scripting tab and select install plugin.
+  - Select the file you saved / downloaded
 
 4. **Restart MySQL Workbench**
 
 5. **Access the plugin**
    - Open a database model or connection
-   - Go to: **Tools** → **Utilities** → **Generate Data Dictionary with ERD**
+   - Go to: **Tools** → **Catalog** → **Generate Data Dictionary with ERD**
 
 ## 📖 Usage
 
