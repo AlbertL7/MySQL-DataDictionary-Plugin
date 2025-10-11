@@ -56,7 +56,7 @@ A powerful MySQL Workbench plugin that automatically generates beautiful, intera
 
 1. **Download the plugin**
    ```bash
-   git clone https://github.com/AlbertL7/DataDictionaryDump.git
+   [git clone https://github.com/AlbertL7/DataDictionaryDump.git](https://github.com/AlbertL7/MySQL-DataDictionary-Plugin.git)
    ```
    - Or you can copy the code and save it as a ".py" file.
 
