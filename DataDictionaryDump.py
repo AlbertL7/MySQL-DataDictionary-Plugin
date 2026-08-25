@@ -1,5 +1,5 @@
 # MySQL Workbench Data Dictionary Generator Plugin with Relationship Visualization
-# Version: 3.5 - With Interactive ERD
+# Version: 3.7 - Live Workbench 8.0 catalog compatibility
 # This version combines the ERD functionality with the complete HTML generation from htmldatadict.py
 
 from wb import *
@@ -10,9 +10,12 @@ import os
 import html
 import json
 import math
+import hashlib
+import tempfile
+from pathlib import Path
 
 # Module registration info
-ModuleInfo = DefineModule(name="DataDictionary", author="Enhanced Generator", version="3.5", description="Generate comprehensive HTML data dictionary with relationship visualization")
+ModuleInfo = DefineModule(name="DataDictionary", author="Albert L. and contributors", version="3.7", description="Generate an accessible HTML data dictionary with relationship visualization")
 
 # ==================== CONFIGURATION ====================
 DEFAULT_CONFIG = {
@@ -32,7 +35,114 @@ def escape_html(text):
     """Safely escape HTML special characters"""
     if text is None:
         return ''
-    return html.escape(str(text))
+    return html.escape(str(text), quote=True)
+
+
+def safe_json_for_html(value):
+    """Serialize JSON for an inert ``application/json`` script element.
+
+    A normal ``json.dumps`` call can contain a literal ``</script>`` sequence.
+    Browsers end a script element at that sequence even when it occurs inside a
+    JSON string. Escaping HTML-significant characters keeps catalog metadata
+    inert until JavaScript explicitly parses it.
+    """
+    return (json.dumps(value, ensure_ascii=False, default=str)
+            .replace('&', '\\u0026')
+            .replace('<', '\\u003c')
+            .replace('>', '\\u003e')
+            .replace('\u2028', '\\u2028')
+            .replace('\u2029', '\\u2029'))
+
+
+def table_dom_id(table_name):
+    """Return a stable HTML id that is safe for every MySQL identifier."""
+    digest = hashlib.sha256(str(table_name).encode('utf-8')).hexdigest()[:16]
+    return 'table-' + digest
+
+
+def sql_identifier(name):
+    """Quote a MySQL identifier, including embedded backticks."""
+    return '`' + str(name).replace('`', '``') + '`'
+
+
+def sql_string(value):
+    """Quote a SQL string using portable doubled-apostrophe escaping."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def index_column(index_item):
+    """Normalize Workbench 8.0/8.4 index-column wrapper objects."""
+    return getattr(index_item, 'referencedColumn', index_item)
+
+
+def index_column_name(index_item):
+    """Return a column name from either a column or IndexColumn wrapper."""
+    column = index_column(index_item)
+    return getattr(column, 'name', str(column))
+
+
+def index_contains_column(index, column):
+    """Compare index membership by referenced column name across GRT versions."""
+    return any(index_column_name(item) == column.name for item in index.columns)
+
+
+def effective_not_null(table, column):
+    """Return effective nullability, including MySQL's implicit PK rule."""
+    return bool(getattr(column, 'isNotNull', False) or
+                table.isPrimaryKeyColumn(column))
+
+
+def display_default(table, column):
+    """Suppress Workbench's spurious DEFAULT NULL sentinel on PK columns."""
+    if getattr(column, 'generated', False):
+        return None
+    value = getattr(column, 'defaultValue', None)
+    if table.isPrimaryKeyColumn(column) and str(value).upper() == 'NULL':
+        return None
+    return value
+
+
+def table_checks(table):
+    """Return check constraints exposed by different Workbench GRT versions."""
+    found = []
+    for attribute in ('checkConstraints', 'checks'):
+        constraints = getattr(table, attribute, None)
+        if constraints:
+            found.extend(list(constraints))
+
+    # Workbench 8.0.47 exposes CHECK constraints through db.Column.checks
+    # rather than through a table-level collection. Keep support for both
+    # shapes because models imported by older Workbench builds differ.
+    for column in getattr(table, 'columns', []) or []:
+        constraints = getattr(column, 'checks', None)
+        if constraints:
+            found.extend(list(constraints))
+
+    unique = []
+    seen = set()
+    for position, check in enumerate(found, 1):
+        key = (check_name(check, position), check_expression(check))
+        if key not in seen:
+            seen.add(key)
+            unique.append(check)
+    return unique
+
+
+def check_name(check, position):
+    """Return a useful check-constraint name without assuming a GRT shape."""
+    return (getattr(check, 'name', '') or
+            getattr(check, 'constraintName', '') or
+            f'check_{position}')
+
+
+def check_expression(check):
+    """Return the expression from common Workbench check object shapes."""
+    if isinstance(check, str):
+        return check
+    return (getattr(check, 'expression', '') or
+            getattr(check, 'checkExpression', '') or
+            getattr(check, 'searchCondition', '') or
+            getattr(check, 'sqlDefinition', '') or '')
 
 def get_type_class(type_str):
     """Determine CSS class for data type coloring"""
@@ -58,42 +168,87 @@ def get_type_class(type_str):
     return ''
 
 def generate_table_ddl(table):
-    """Generate CREATE TABLE statement"""
-    ddl = f"CREATE TABLE `{table.name}` (\n"
+    """Generate reviewable reconstruction DDL from Workbench model metadata."""
+    ddl = f"CREATE TABLE {sql_identifier(table.name)} (\n"
 
     # Columns
     column_definitions = []
     for column in table.columns:
-        col_def = f"  `{column.name}` {column.formattedType}"
-        if column.isNotNull:
+        col_def = f"  {sql_identifier(column.name)} {column.formattedType}"
+        generated_expression = (getattr(column, 'generatedExpression', '') or
+                                getattr(column, 'expression', ''))
+        if getattr(column, 'generated', False) and generated_expression:
+            col_def += f" GENERATED ALWAYS AS ({generated_expression})"
+            if getattr(column, 'generatedStorage', ''):
+                col_def += f" {column.generatedStorage}"
+        if effective_not_null(table, column):
             col_def += " NOT NULL"
-        if column.defaultValue:
-            col_def += f" DEFAULT {column.defaultValue}"
+        default_value = display_default(table, column)
+        if default_value not in (None, '') and not getattr(column, 'generated', False):
+            col_def += f" DEFAULT {default_value}"
         if column.autoIncrement:
             col_def += " AUTO_INCREMENT"
         if column.comment:
-            col_def += f" COMMENT '{escape_html(column.comment)}'"
+            col_def += f" COMMENT {sql_string(column.comment)}"
         column_definitions.append(col_def)
 
     # Primary key
     pk_columns = [col.name for col in table.columns if table.isPrimaryKeyColumn(col)]
     if pk_columns:
-        column_definitions.append(f"  PRIMARY KEY ({', '.join([f'`{c}`' for c in pk_columns])})")
+        column_definitions.append(
+            f"  PRIMARY KEY ({', '.join(sql_identifier(c) for c in pk_columns)})"
+        )
+
+    # Secondary and unique indexes. Workbench may expose either direct columns
+    # or db.IndexColumn wrappers depending on the catalog source/version.
+    for index in table.indices:
+        index_name = getattr(index, 'name', '')
+        if not index_name or index_name.upper() == 'PRIMARY':
+            continue
+        index_columns = [index_column_name(item) for item in index.columns]
+        if not index_columns:
+            continue
+        keyword = 'UNIQUE KEY' if getattr(index, 'unique', False) else 'KEY'
+        column_definitions.append(
+            f"  {keyword} {sql_identifier(index_name)} "
+            f"({', '.join(sql_identifier(name) for name in index_columns)})"
+        )
+
+    # CHECK constraint objects differ across Workbench catalog versions, so
+    # accept all common shapes and omit only constraints without an expression.
+    for position, check in enumerate(table_checks(table), 1):
+        expression = check_expression(check)
+        if expression:
+            column_definitions.append(
+                f"  CONSTRAINT {sql_identifier(check_name(check, position))} "
+                f"CHECK ({expression})"
+            )
 
     # Foreign keys
     for fk in table.foreignKeys:
-        fk_cols = ', '.join([f'`{col.name}`' for col in fk.columns])
-        ref_cols = ', '.join([f'`{col.name}`' for col in fk.referencedColumns])
-        column_definitions.append(
-            f"  CONSTRAINT `{fk.name}` FOREIGN KEY ({fk_cols}) "
-            f"REFERENCES `{fk.referencedTable.name}` ({ref_cols})"
+        fk_cols = ', '.join(sql_identifier(col.name) for col in fk.columns)
+        ref_cols = ', '.join(sql_identifier(col.name) for col in fk.referencedColumns)
+        fk_def = (
+            f"  CONSTRAINT {sql_identifier(fk.name)} FOREIGN KEY ({fk_cols}) "
+            f"REFERENCES {sql_identifier(fk.referencedTable.name)} ({ref_cols})"
         )
+        delete_rule = getattr(fk, 'deleteRule', '')
+        update_rule = getattr(fk, 'updateRule', '')
+        if delete_rule:
+            fk_def += f" ON DELETE {delete_rule}"
+        if update_rule:
+            fk_def += f" ON UPDATE {update_rule}"
+        column_definitions.append(fk_def)
 
     ddl += ',\n'.join(column_definitions)
     ddl += "\n)"
 
     if table.comment:
-        ddl += f" COMMENT='{escape_html(table.comment)}'"
+        ddl += f" COMMENT={sql_string(table.comment)}"
+
+    table_engine = getattr(table, 'tableEngine', '')
+    if table_engine:
+        ddl += f" ENGINE={table_engine}"
 
     ddl += ";"
     return ddl
@@ -110,18 +265,19 @@ def calculate_layout_positions(tables, relationships, layout_type='force-directe
     MARGIN = 80               # Margin from edges
 
     if layout_type == 'hierarchical':
-        # Hierarchical layout based on relationship depth
+        # Hierarchical layout: referenced/parent tables above child tables.
+        # Self-references do not make an otherwise-root table into a child.
         levels = {}
         processed = set()
 
-        # Find root tables (no incoming foreign keys)
+        # Relationships point from child to referenced parent.
         root_tables = []
-        referenced_tables = set()
-        for rel in relationships:
-            referenced_tables.add(rel['to'])
+        child_tables = {
+            rel['from'] for rel in relationships if rel['from'] != rel['to']
+        }
 
         for table_name in tables:
-            if table_name not in referenced_tables:
+            if table_name not in child_tables:
                 root_tables.append(table_name)
                 levels[table_name] = 0
                 processed.add(table_name)
@@ -139,9 +295,11 @@ def calculate_layout_positions(tables, relationships, layout_type='force-directe
             current_level += 1
             made_progress = False
             for rel in relationships:
-                if rel['from'] in levels and rel['to'] not in processed:
-                    levels[rel['to']] = current_level
-                    processed.add(rel['to'])
+                if rel['from'] == rel['to']:
+                    continue
+                if rel['to'] in levels and rel['from'] not in processed:
+                    levels[rel['from']] = levels[rel['to']] + 1
+                    processed.add(rel['from'])
                     made_progress = True
             if not made_progress:
                 break
@@ -176,7 +334,7 @@ def calculate_layout_positions(tables, relationships, layout_type='force-directe
             positions[table_name] = {'x': x, 'y': y}
             level_indices[level] += 1
 
-    else:  # force-directed layout - improved grid
+    else:  # Stable balanced-grid layout
         num_tables = len(tables)
         # Optimize columns for better layout
         cols = min(5, max(3, math.ceil(math.sqrt(num_tables))))
@@ -199,9 +357,16 @@ def generate_relationship_diagram(schema, config):
     # Collect relationships
     relationships = []
     tables_with_relationships = set()
+    all_tables = [table.name for table in schema.tables]
+    local_table_names = set(all_tables)
 
     for table in schema.tables:
         for fk in table.foreignKeys:
+            # The report documents one selected schema. Keep cross-schema
+            # relationships in the textual table details, but omit them from
+            # this diagram because the external table has no local node.
+            if fk.referencedTable.name not in local_table_names:
+                continue
             relationships.append({
                 'from': table.name,
                 'to': fk.referencedTable.name,
@@ -211,9 +376,6 @@ def generate_relationship_diagram(schema, config):
             })
             tables_with_relationships.add(table.name)
             tables_with_relationships.add(fk.referencedTable.name)
-
-    # Get all table names
-    all_tables = [table.name for table in schema.tables]
 
     # Calculate layout
     positions = calculate_layout_positions(all_tables, relationships, config.get('diagram_layout', 'force-directed'))
@@ -234,16 +396,20 @@ def generate_relationship_diagram(schema, config):
     svg = f'''
     <div class="erd-container">
         <div class="erd-header">
-            <h2>📊 Entity Relationship Diagram</h2>
+            <h2 id="erd-heading">Entity Relationship Diagram</h2>
             <div class="erd-controls">
-                <button onclick="zoomIn()" class="erd-btn">🔍 Zoom In</button>
-                <button onclick="zoomOut()" class="erd-btn">🔍 Zoom Out</button>
-                <button onclick="resetZoom()" class="erd-btn">↺ Reset</button>
-                <button onclick="toggleERDFullscreen()" class="erd-btn">⛶ Fullscreen</button>
+                <button type="button" onclick="zoomIn()" class="erd-btn" aria-label="Zoom in on diagram">Zoom in</button>
+                <button type="button" onclick="zoomOut()" class="erd-btn" aria-label="Zoom out on diagram">Zoom out</button>
+                <button type="button" onclick="resetZoom()" class="erd-btn">Reset</button>
+                <button type="button" id="erdFullscreenButton" onclick="toggleERDFullscreen()" class="erd-btn" aria-pressed="false">Fullscreen</button>
             </div>
         </div>
         <div class="erd-wrapper" id="erdWrapper">
-            <svg id="erdDiagram" width="{svg_width}" height="{svg_height}" viewBox="0 0 {svg_width} {svg_height}">
+            <button type="button" id="erdFullscreenExit" class="erd-fullscreen-exit" onclick="toggleERDFullscreen()">Exit fullscreen</button>
+            <svg id="erdDiagram" width="{svg_width}" height="{svg_height}" viewBox="0 0 {svg_width} {svg_height}"
+                 role="img" aria-labelledby="erd-title erd-description">
+                <title id="erd-title">Tables and foreign-key relationships</title>
+                <desc id="erd-description">Select a table node to jump to its detailed column definition.</desc>
                 <defs>
                     <!-- Arrow marker for relationships -->
                     <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
@@ -284,25 +450,31 @@ def generate_relationship_diagram(schema, config):
         to_x = to_pos['x'] + 110
         to_y = to_pos['y'] + 45
 
-        # Calculate midpoint
-        mid_x = (from_x + to_x) / 2
-        mid_y = (from_y + to_y) / 2
-
-        # Calculate distance and angle for better curves
-        dx = to_x - from_x
-        dy = to_y - from_y
-        distance = math.sqrt(dx * dx + dy * dy)
-
-        # Create control point offset based on direction
-        # This creates smoother, more natural curves
-        if abs(dx) > abs(dy):
-            # Horizontal-ish line
-            control_x = mid_x
-            control_y = mid_y + (distance * 0.15 if dy >= 0 else -distance * 0.15)
+        if rel['from'] == rel['to']:
+            # A normal center-to-center path has zero length for a self-FK.
+            # Draw an explicit loop from the right edge back to the same node.
+            start_x = from_pos['x'] + 220
+            start_y = from_pos['y'] + 28
+            end_x = from_pos['x'] + 220
+            end_y = from_pos['y'] + 68
+            loop_x = from_pos['x'] + 305
+            path_d = (f"M {start_x} {start_y} C {loop_x} {start_y - 45}, "
+                      f"{loop_x} {end_y + 45}, {end_x} {end_y}")
+            mid_x = loop_x - 5
+            mid_y = from_pos['y'] + 45
         else:
-            # Vertical-ish line
-            control_x = mid_x + (distance * 0.15 if dx >= 0 else -distance * 0.15)
-            control_y = mid_y
+            mid_x = (from_x + to_x) / 2
+            mid_y = (from_y + to_y) / 2
+            dx = to_x - from_x
+            dy = to_y - from_y
+            distance = math.sqrt(dx * dx + dy * dy)
+            if abs(dx) > abs(dy):
+                control_x = mid_x
+                control_y = mid_y + (distance * 0.15 if dy >= 0 else -distance * 0.15)
+            else:
+                control_x = mid_x + (distance * 0.15 if dx >= 0 else -distance * 0.15)
+                control_y = mid_y
+            path_d = f"M {from_x} {from_y} Q {control_x} {control_y} {to_x} {to_y}"
 
         # Relationship label - only show FK name if it's short
         rel_name = rel['name']
@@ -313,8 +485,11 @@ def generate_relationship_diagram(schema, config):
         label_y = mid_y - 8
 
         svg += f'''
-                    <g class="relationship" data-from="{escape_html(rel['from'])}" data-to="{escape_html(rel['to'])}">
-                        <path d="M {from_x} {from_y} Q {control_x} {control_y} {to_x} {to_y}"
+                    <g class="relationship" data-from="{escape_html(rel['from'])}" data-to="{escape_html(rel['to'])}"
+                       role="group" tabindex="0"
+                       aria-label="{escape_html(rel['name'])}: {escape_html(rel['from'])}.{escape_html(rel['columns'])} references {escape_html(rel['to'])}.{escape_html(rel['ref_columns'])}">
+                        <title>{escape_html(rel['name'])}: {escape_html(rel['from'])}.{escape_html(rel['columns'])} → {escape_html(rel['to'])}.{escape_html(rel['ref_columns'])}</title>
+                        <path d="{path_d}"
                               stroke="#2563eb" stroke-width="1.5" fill="none"
                               marker-end="url(#arrowhead)" opacity="0.5"
                               class="relationship-line"/>
@@ -360,10 +535,14 @@ def generate_relationship_diagram(schema, config):
             # Truncate long table names for display
             display_name = table.name if len(table.name) <= 18 else table.name[:15] + '...'
 
+            target_id = table_dom_id(table.name)
             svg += f'''
                     <g class="table-node {node_class}" data-table="{escape_html(table.name)}"
                        transform="translate({x}, {y})"
-                       onclick="jumpToTable('{escape_html(table.name)}')">
+                       role="link" tabindex="0"
+                       aria-label="View details for {escape_html(table.name)}"
+                       onclick="jumpToTable('{target_id}')"
+                       onkeydown="if (event.key === 'Enter' || event.key === ' ') {{ event.preventDefault(); jumpToTable('{target_id}'); }}">
 
                         <!-- Table background with clean shadow -->
                         <rect x="0" y="0" width="220" height="85" rx="10" ry="10"
@@ -512,6 +691,25 @@ def generate_erd_styles():
             background: white;
         }
 
+        .erd-fullscreen-exit {
+            display: none;
+        }
+
+        .erd-wrapper.fullscreen .erd-fullscreen-exit {
+            display: block;
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 10001;
+            padding: 10px 16px;
+            border: 2px solid var(--primary);
+            border-radius: 8px;
+            background: var(--white);
+            color: var(--primary-dark);
+            font-weight: 700;
+            cursor: pointer;
+        }
+
         #erdDiagram {
             transition: transform 0.3s ease;
             transform-origin: center center;
@@ -555,11 +753,33 @@ def generate_erd_styles():
         .relationship-label {
             transition: font-weight 0.2s ease, fill 0.2s ease;
             pointer-events: none;
+            opacity: 0;
         }
 
-        .relationship:hover .relationship-label {
+        .relationship-label-bg {
+            opacity: 0;
+        }
+
+        .relationship:hover .relationship-label,
+        .relationship:hover .relationship-label-bg,
+        .relationship:focus .relationship-label,
+        .relationship:focus .relationship-label-bg {
+            opacity: 1;
+        }
+
+        .relationship:hover .relationship-label,
+        .relationship:focus .relationship-label {
             font-weight: bold;
             fill: var(--primary);
+        }
+
+        .relationship:focus {
+            outline: none;
+        }
+
+        .relationship:focus .relationship-line {
+            stroke-width: 3;
+            opacity: 1;
         }
 
         .table-name-text {
@@ -649,21 +869,37 @@ def generate_erd_scripts():
 
         function applyZoom() {
             const svg = document.getElementById('erdDiagram');
-            svg.style.transform = `scale(${currentZoom})`;
+            if (!svg.dataset.baseWidth) {
+                svg.dataset.baseWidth = svg.getAttribute('width');
+                svg.dataset.baseHeight = svg.getAttribute('height');
+            }
+            const width = Number(svg.dataset.baseWidth) * currentZoom;
+            const height = Number(svg.dataset.baseHeight) * currentZoom;
+            svg.style.width = `${width}px`;
+            svg.style.height = `${height}px`;
+            svg.style.transform = 'none';
         }
 
         function toggleERDFullscreen() {
             const wrapper = document.getElementById('erdWrapper');
+            const toggleButton = document.getElementById('erdFullscreenButton');
+            const exitButton = document.getElementById('erdFullscreenExit');
             wrapper.classList.toggle('fullscreen');
 
             if (wrapper.classList.contains('fullscreen')) {
                 document.body.style.overflow = 'hidden';
+                if (toggleButton) toggleButton.setAttribute('aria-pressed', 'true');
+                if (exitButton) exitButton.focus();
             } else {
                 document.body.style.overflow = '';
+                if (toggleButton) {
+                    toggleButton.setAttribute('aria-pressed', 'false');
+                    toggleButton.focus();
+                }
             }
         }
 
-        function jumpToTable(tableName) {
+        function jumpToTable(tableId) {
             // Remove fullscreen if active
             const wrapper = document.getElementById('erdWrapper');
             if (wrapper.classList.contains('fullscreen')) {
@@ -671,7 +907,7 @@ def generate_erd_scripts():
             }
 
             // Scroll to table
-            const tableElement = document.getElementById(tableName);
+            const tableElement = document.getElementById(tableId);
             if (tableElement) {
                 tableElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
@@ -700,10 +936,14 @@ def generate_erd_scripts():
 
                             // Highlight connected tables
                             if (rel.dataset.from === tableName) {
-                                const targetNode = document.querySelector(`.table-node[data-table="${rel.dataset.to}"]`);
+                                const targetNode = Array.from(tableNodes).find(
+                                    candidate => candidate.dataset.table === rel.dataset.to
+                                );
                                 if (targetNode) targetNode.classList.add('highlight-target');
                             } else {
-                                const sourceNode = document.querySelector(`.table-node[data-table="${rel.dataset.from}"]`);
+                                const sourceNode = Array.from(tableNodes).find(
+                                    candidate => candidate.dataset.table === rel.dataset.from
+                                );
                                 if (sourceNode) sourceNode.classList.add('highlight-source');
                             }
                         }
@@ -790,6 +1030,21 @@ def generate_html_content(schema, config):
         'columns': sum(len(table.columns) for table in schema.tables),
         'foreign_keys': sum(len(table.foreignKeys) for table in schema.tables),
         'indexes': sum(len(table.indices) for table in schema.tables),
+        'unique_groups': sum(
+            1 for table in schema.tables for index in table.indices
+            if getattr(index, 'unique', False)
+            and not getattr(index, 'isPrimary', False)
+            and getattr(index, 'name', '').upper() != 'PRIMARY'
+        ),
+        'checks': sum(len(table_checks(table)) for table in schema.tables),
+        'generated_columns': sum(
+            bool(getattr(column, 'generated', False))
+            for table in schema.tables for column in table.columns
+        ),
+        'innodb_tables': sum(
+            getattr(table, 'tableEngine', '').lower() == 'innodb'
+            for table in schema.tables
+        ),
         'views': 0,
         'routines': 0,
         'triggers': 0
@@ -862,6 +1117,58 @@ def generate_html_content(schema, config):
             min-height: 100vh;
             padding: 30px;
             font-size: 15px;
+        }
+
+        .skip-link {
+            position: fixed;
+            top: 8px;
+            left: 8px;
+            z-index: 2000;
+            padding: 10px 14px;
+            color: var(--white);
+            background: var(--dark);
+            border-radius: 6px;
+            transform: translateY(-160%);
+        }
+
+        .skip-link:focus {
+            transform: translateY(0);
+        }
+
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+
+        :focus-visible {
+            outline: 3px solid #f59e0b;
+            outline-offset: 3px;
+        }
+
+        .quick-start {
+            margin: 30px 36px 0;
+            padding: 24px;
+            border: 2px solid #bfdbfe;
+            border-radius: 12px;
+            background: #eff6ff;
+        }
+
+        .quick-start h2 {
+            margin-bottom: 14px;
+            font-size: 1.5rem;
+        }
+
+        .quick-start ol {
+            margin-left: 24px;
+            display: grid;
+            gap: 8px;
         }
 
         .container {
@@ -1176,29 +1483,54 @@ def generate_html_content(schema, config):
             background: var(--table-header-bg);
             color: var(--table-header-text);
             padding: 24px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            cursor: pointer;
-            position: relative;
+            display: grid;
+            grid-template-columns: minmax(220px, 1fr) auto;
+            grid-template-areas:
+                "name actions"
+                "meta meta";
+            align-items: start;
+            gap: 14px 24px;
             border-bottom: 3px solid var(--primary);
         }
 
-        .table-header:hover {
-            background: var(--gray-900);
-        }
-
         .table-name-section {
-            flex: 1;
+            grid-area: name;
+            min-width: 0;
         }
 
         .table-name {
+            margin: 0;
             font-size: 1.625rem;
             font-weight: 700;
-            display: flex;
+            color: var(--white);
+        }
+
+        .table-toggle {
+            appearance: none;
+            display: inline-flex;
             align-items: center;
             gap: 12px;
-            color: var(--white);
+            max-width: 100%;
+            padding: 3px 5px;
+            margin: -3px -5px;
+            border: 0;
+            border-radius: 6px;
+            background: transparent;
+            color: inherit;
+            font: inherit;
+            font-weight: inherit;
+            text-align: left;
+            cursor: pointer;
+            overflow-wrap: anywhere;
+        }
+
+        .table-toggle:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .table-toggle:focus-visible {
+            outline: 3px solid var(--warning);
+            outline-offset: 3px;
         }
 
         .table-comment {
@@ -1220,7 +1552,9 @@ def generate_html_content(schema, config):
         }
 
         .table-meta {
+            grid-area: meta;
             display: flex;
+            flex-wrap: wrap;
             gap: 24px;
             font-size: 0.9375rem;
             font-weight: 600;
@@ -1228,9 +1562,8 @@ def generate_html_content(schema, config):
         }
 
         .table-actions {
-            position: absolute;
-            top: 20px;
-            right: 24px;
+            grid-area: actions;
+            align-self: start;
         }
 
         .btn-copy-ddl {
@@ -1254,6 +1587,10 @@ def generate_html_content(schema, config):
         .table-content {
             overflow-x: auto;
             background: var(--white);
+        }
+
+        .table-content > table {
+            min-width: 900px;
         }
 
         table {
@@ -1584,12 +1921,24 @@ def generate_html_content(schema, config):
             justify-content: center;
             box-shadow: 0 10px 25px -5px rgba(37, 99, 235, 0.4);
             cursor: pointer;
-            transition: all 0.3s;
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+            transform: translateY(10px);
+            transition: opacity 0.2s, visibility 0.2s, transform 0.2s,
+                        background 0.2s, box-shadow 0.2s;
             text-decoration: none;
             font-size: 1.5rem;
             font-weight: bold;
             z-index: 100;
             border: 2px solid transparent;
+        }
+
+        .back-to-top.visible {
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+            transform: translateY(0);
         }
 
         .back-to-top:hover {
@@ -1632,6 +1981,114 @@ def generate_html_content(schema, config):
             display: block !important;
         }
 
+        @media (max-width: 900px) {
+            body {
+                padding: 12px;
+            }
+
+            .header {
+                padding: 32px 24px;
+            }
+
+            .header h1 {
+                font-size: 2.25rem;
+            }
+
+            .header .meta-info,
+            .export-buttons {
+                position: static;
+                margin-top: 18px;
+                text-align: left;
+            }
+
+            .export-buttons,
+            .filter-buttons,
+            .erd-controls,
+            .erd-legend,
+            .table-meta {
+                flex-wrap: wrap;
+            }
+
+            .search-container,
+            .erd-header {
+                align-items: stretch;
+                flex-direction: column;
+            }
+
+            .table-header {
+                grid-template-columns: 1fr;
+                grid-template-areas:
+                    "name"
+                    "meta"
+                    "actions";
+            }
+
+            .quick-start,
+            .erd-container {
+                margin-left: 18px;
+                margin-right: 18px;
+            }
+
+            .legend,
+            .toc,
+            .tables-container,
+            .stats-grid,
+            .search-container {
+                padding: 24px 18px;
+            }
+
+            .table-meta {
+                gap: 10px 18px;
+            }
+
+            .erd-wrapper {
+                padding: 20px;
+            }
+        }
+
+        @media (max-width: 560px) {
+            body {
+                padding: 0;
+            }
+
+            .container {
+                border-radius: 0;
+            }
+
+            .header h1 {
+                font-size: 1.9rem;
+            }
+
+            .export-buttons > *,
+            .filter-buttons > * {
+                flex: 1 1 100%;
+            }
+
+            .stats-grid,
+            .legend-grid,
+            .toc-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .table-header {
+                padding: 18px;
+            }
+
+            .table-name {
+                font-size: 1.25rem;
+                overflow-wrap: anywhere;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                scroll-behavior: auto !important;
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+
         /* Enhanced Print/PDF Styles */
         @media print {
             /* Page setup */
@@ -1649,6 +2106,7 @@ def generate_html_content(schema, config):
             /* Hide interactive elements */
             .search-container,
             .back-to-top,
+            .skip-link,
             .export-buttons,
             .filter-buttons,
             .table-actions,
@@ -1722,7 +2180,10 @@ def generate_html_content(schema, config):
 
             /* Legend */
             .legend {
-                page-break-after: avoid !important;
+                break-inside: avoid !important;
+                page-break-inside: avoid !important;
+                break-after: auto !important;
+                page-break-after: auto !important;
                 padding: 5mm !important;
                 margin-bottom: 5mm !important;
                 border: 2px solid #d1d5db !important;
@@ -1737,6 +2198,8 @@ def generate_html_content(schema, config):
 
             .legend-grid {
                 gap: 2mm !important;
+                break-inside: avoid !important;
+                page-break-inside: avoid !important;
             }
 
             .legend-badge {
@@ -1747,7 +2210,7 @@ def generate_html_content(schema, config):
             /* ERD for print */
             .erd-container {
                 page-break-before: always !important;
-                page-break-after: always !important;
+                page-break-after: auto !important;
                 margin: 0 !important;
                 border: 2px solid #000 !important;
             }
@@ -1788,6 +2251,8 @@ def generate_html_content(schema, config):
 
             /* Tables container */
             .tables-container {
+                break-before: page !important;
+                page-break-before: always !important;
                 padding: 0 !important;
                 background: white !important;
             }
@@ -1844,6 +2309,10 @@ def generate_html_content(schema, config):
                 display: block !important;
                 overflow: visible !important;
                 background: white !important;
+            }
+
+            .table-content > table {
+                min-width: 0 !important;
             }
 
             /* Data tables */
@@ -2079,22 +2548,25 @@ def generate_html_content(schema, config):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%232563eb'/%3E%3Ctext x='32' y='43' font-size='34' text-anchor='middle' fill='white'%3ED%3C/text%3E%3C/svg%3E">
     <title>Data Dictionary - {escape_html(schema.name)}</title>
     <style>{styles}</style>
 </head>
 <body>
-    <div class="container">
+    <a class="skip-link" href="#main-content">Skip to data dictionary</a>
+    <main class="container" id="main-content">
         <div class="header">
-            <h1>📊 Data Dictionary</h1>
+            <h1>Data Dictionary</h1>
             <div class="subtitle">{escape_html(schema.name)} Database Schema</div>
             <div class="meta-info">
                 <div>Generated: {generation_time}</div>
-                <div>Version: 3.5 with ERD</div>
+                <div>Plugin version: 3.7</div>
             </div>
             <div class="export-buttons">
-                <button class="export-btn" onclick="exportToCSV()">📊 Export CSV</button>
-                <button class="export-btn" onclick="exportToJSON()">📋 Export JSON</button>
-                <button class="export-btn" onclick="printToPDF()">🖨️ Print to PDF</button>
+                <button type="button" class="export-btn" onclick="exportToCSV()">Export CSV</button>
+                <button type="button" class="export-btn" onclick="exportToJSON()">Export JSON</button>
+                <button type="button" class="export-btn" onclick="printToPDF()">Print / Save PDF</button>
             </div>
         </div>
 
@@ -2139,6 +2611,15 @@ def generate_html_content(schema, config):
 
     html_content += """
         </div>
+
+        <section class="quick-start" aria-labelledby="quick-start-heading">
+            <h2 id="quick-start-heading">Start here</h2>
+            <ol>
+                <li>Confirm the table, column, and foreign-key totals above.</li>
+                <li>Use the diagram or table list to understand how tables connect.</li>
+                <li>Open one table at a time; required fields, keys, defaults, indexes, and relationships are explained in its detail section.</li>
+            </ol>
+        </section>
 """
 
     # Add ERD if configured
@@ -2177,19 +2658,21 @@ def generate_html_content(schema, config):
         </div>
 
         <div class="search-container">
-            <input type="text" id="searchBox" class="search-box" placeholder="🔍 Search tables, columns, and comments..." onkeyup="searchWithDebounce()">
+            <label class="sr-only" for="searchBox">Search tables, columns, and comments</label>
+            <input type="search" id="searchBox" class="search-box" placeholder="Search tables, columns, and comments" oninput="searchWithDebounce()">
             <div class="filter-buttons">
-                <button class="filter-btn active" onclick="filterTables('all')">All Tables</button>
-                <button class="filter-btn" onclick="filterTables('has-fk')">Has FK</button>
-                <button class="filter-btn" onclick="filterTables('no-fk')">No FK</button>
-                <button class="filter-btn" onclick="toggleAllTables()">Toggle All</button>
+                <button type="button" class="filter-btn active" aria-pressed="true" data-filter="all" onclick="filterTables('all')">All tables</button>
+                <button type="button" class="filter-btn" aria-pressed="false" data-filter="child" onclick="filterTables('child')">Child tables</button>
+                <button type="button" class="filter-btn" aria-pressed="false" data-filter="referenced" onclick="filterTables('referenced')">Referenced tables</button>
+                <button type="button" class="filter-btn" aria-pressed="false" data-filter="isolated" onclick="filterTables('isolated')">Isolated tables</button>
+                <button type="button" class="filter-btn" onclick="toggleAllTables()">Expand / collapse all</button>
             </div>
         </div>
 
         <div class="toc">
             <div class="toc-header">
                 <h2>Database Tables</h2>
-                <span style="color: #6b7280; font-size: 0.9375rem;">Click to jump to table • Click header to collapse</span>
+                <span style="color: #4b5563; font-size: 0.9375rem;">Choose a table, then expand or collapse its details.</span>
             </div>
             <div class="toc-grid">
 """
@@ -2198,7 +2681,8 @@ def generate_html_content(schema, config):
     for table in schema.tables:
         col_count = len(table.columns)
         fk_count = len(table.foreignKeys)
-        html_content += f"""                <a href="#{escape_html(table.name)}" class="toc-item" data-fk-count="{fk_count}">
+        target_id = table_dom_id(table.name)
+        html_content += f"""                <a href="#{target_id}" class="toc-item" data-fk-count="{fk_count}">
                     <span>{escape_html(table.name)}</span>
                     <span class="toc-meta">{col_count} cols | {fk_count} FKs</span>
                 </a>
@@ -2213,61 +2697,78 @@ def generate_html_content(schema, config):
     # Generate DDL storage for JavaScript
     ddl_scripts = {}
 
+    # Build the reverse side of every relationship once so each table can show
+    # both "references" and "referenced by" information.
+    incoming_relationships = {table.name: [] for table in schema.tables}
+    for source_table in schema.tables:
+        for fk in source_table.foreignKeys:
+            incoming_relationships.setdefault(fk.referencedTable.name, []).append(
+                (source_table, fk)
+            )
+
     # Generate each table
     for table in schema.tables:
         table_name_escaped = escape_html(table.name)
+        table_id = table_dom_id(table.name)
+        table_content_id = table_id + '-content'
         col_count = len(table.columns)
         fk_count = len(table.foreignKeys)
+        incoming_count = len(incoming_relationships.get(table.name, []))
         idx_count = len(table.indices)
 
         # Generate DDL for this table
         if config.get('generate_ddl', True):
             ddl = generate_table_ddl(table)
-            ddl_scripts[table.name] = escape_html(ddl)
+            ddl_scripts[table_id] = ddl
 
         # Table comment if exists
         table_comment_html = ""
         if table.comment:
             table_comment_html = f'<div class="table-comment">{escape_html(table.comment)}</div>'
 
-        html_content += f"""            <div class="table-wrapper" id="{table_name_escaped}" data-fk-count="{fk_count}">
-                <div class="table-header" onclick="toggleTable('{table_name_escaped}')">
+        html_content += f"""            <section class="table-wrapper" id="{table_id}" data-fk-count="{fk_count}" data-incoming-fk-count="{incoming_count}" data-table-name="{table_name_escaped}">
+                <div class="table-header">
                     <div class="table-name-section">
-                        <div class="table-name">
-                            {table_name_escaped}
-                            <span class="collapse-indicator">▼</span>
-                        </div>
+                        <h3 class="table-name">
+                            <button type="button" class="table-toggle" aria-expanded="true" aria-controls="{table_content_id}"
+                                    onclick="toggleTable('{table_id}')">
+                                <span>{table_name_escaped}</span>
+                                <span class="collapse-indicator" aria-hidden="true">▼</span>
+                            </button>
+                        </h3>
                         {table_comment_html}
                     </div>
                     <div class="table-meta">
                         <span>📋 {col_count} Columns</span>
-                        <span>🔗 {fk_count} Foreign Keys</span>
+                        <span>↗ {fk_count} Outgoing FKs</span>
+                        <span>↙ {incoming_count} Incoming FKs</span>
                         <span>📍 {idx_count} Indexes</span>
                     </div>"""
 
         if config.get('generate_ddl', True):
             html_content += f"""
                     <div class="table-actions">
-                        <button class="btn-copy-ddl" onclick="event.stopPropagation(); showDDL('{table_name_escaped}')">📝 View DDL</button>
+                        <button type="button" class="btn-copy-ddl" onclick="event.stopPropagation(); showDDL('{table_id}')">View reference DDL</button>
                     </div>"""
 
         html_content += f"""
                 </div>
-                <div class="table-content">
+                <div class="table-content" id="{table_content_id}">
                     <table>
+                        <caption class="sr-only">Column definitions for {table_name_escaped}</caption>
                         <thead>
                             <tr>
-                                <th style="width: 3%">#</th>
-                                <th style="width: 20%">Column Name</th>
-                                <th style="width: 15%">Data Type</th>
-                                <th style="width: 8%">Nullable</th>
-                                <th style="width: 12%">Constraints</th>
-                                <th style="width: 12%">Default</th>
-                                <th style="width: 10%">Extra</th>"""
+                                <th scope="col" style="width: 3%">#</th>
+                                <th scope="col" style="width: 20%">Column name</th>
+                                <th scope="col" style="width: 15%">Data type</th>
+                                <th scope="col" style="width: 8%">Nullable</th>
+                                <th scope="col" style="width: 12%">Keys / indexes</th>
+                                <th scope="col" style="width: 12%">Default</th>
+                                <th scope="col" style="width: 10%">Extra</th>"""
 
         if config.get('include_comments', True):
             html_content += """
-                                <th style="width: 20%">Comment</th>"""
+                                <th scope="col" style="width: 20%">Comment</th>"""
 
         html_content += """
                             </tr>
@@ -2287,30 +2788,46 @@ def generate_html_content(schema, config):
             if table.isForeignKeyColumn(column):
                 keys.append('<span class="key-badge badge-fk">FK</span>')
 
-            # Check for unique constraint
+            # Check for unique constraints. A column in a composite unique key
+            # is not unique by itself, so label it as a group member instead of
+            # showing the misleading single-column UQ badge.
             for index in table.indices:
-                if index.unique and column in index.columns:
-                    keys.append('<span class="key-badge badge-unique">UQ</span>')
+                index_name = getattr(index, 'name', '') or ''
+                if (getattr(index, 'unique', False) and
+                        index_name.upper() != 'PRIMARY' and
+                        not table.isPrimaryKeyColumn(column) and
+                        index_contains_column(index, column)):
+                    member_count = len(index.columns)
+                    badge = 'UQ' if member_count == 1 else 'UQ group'
+                    explanation = ('Unique by itself' if member_count == 1 else
+                                   'Part of a composite unique constraint')
+                    keys.append(
+                        f'<span class="key-badge badge-unique" '
+                        f'title="{explanation}">{badge}</span>'
+                    )
                     break
 
             # Check for regular index
             if config.get('include_indexes', True):
                 for index in table.indices:
-                    if not index.unique and column in index.columns and not table.isPrimaryKeyColumn(column):
+                    if (not getattr(index, 'unique', False) and
+                            index_contains_column(index, column) and
+                            not table.isPrimaryKeyColumn(column)):
                         keys.append('<span class="key-badge badge-index">IDX</span>')
                         break
 
             key_str = ' '.join(keys) if keys else '-'
 
             # Nullable - clearer display
-            if column.isNotNull == 1:
+            if effective_not_null(table, column):
                 nullable = '<span class="key-badge badge-nn">NOT NULL</span>'
             else:
                 nullable = '<span class="key-badge badge-null">NULL</span>'
 
             # Default value
-            if column.defaultValue:
-                default = f'<span class="default-value">{escape_html(column.defaultValue)}</span>'
+            default_value = display_default(table, column)
+            if default_value not in (None, ''):
+                default = f'<span class="default-value">{escape_html(default_value)}</span>'
             else:
                 default = '<span style="color: #9ca3af;">-</span>'
 
@@ -2319,7 +2836,8 @@ def generate_html_content(schema, config):
             if column.autoIncrement:
                 extras.append('AUTO_INCREMENT')
             if hasattr(column, 'generated') and column.generated:
-                extras.append('GENERATED')
+                storage = getattr(column, 'generatedStorage', '') or ''
+                extras.append(('GENERATED ' + storage).strip())
             extra_str = ', '.join(extras) if extras else '<span style="color: #9ca3af;">-</span>'
 
             html_content += f"""                            <tr>
@@ -2351,12 +2869,12 @@ def generate_html_content(schema, config):
         # Add indexes section if configured
         if config.get('include_indexes', True) and table.indices:
             html_content += """                    <div class="indexes-section">
-                        <strong>📍 Index Information</strong>
+                        <strong>Index information</strong>
 """
             for index in table.indices:
-                index_cols = ', '.join([col.name for col in index.columns])
-                index_type = "UNIQUE" if index.unique else "INDEX"
-                if index.indexType:
+                index_cols = ', '.join(index_column_name(col) for col in index.columns)
+                index_type = "UNIQUE" if getattr(index, 'unique', False) else "INDEX"
+                if getattr(index, 'indexType', ''):
                     index_type += f" ({index.indexType})"
 
                 html_content += f"""                        <div class="index-item">
@@ -2364,23 +2882,70 @@ def generate_html_content(schema, config):
                                 <span style="font-weight: 700;">{escape_html(index.name)}</span>
                                 <span style="color: #6b7280;"> ({escape_html(index_cols)})</span>
                             </div>
-                            <span class="index-type">{index_type}</span>
+                            <span class="index-type">{escape_html(index_type)}</span>
                         </div>
 """
             html_content += """                    </div>
 """
 
-        # Add foreign key relationships if any
+        # Add outgoing foreign-key relationships with the modeling details that
+        # matter in the Week 3 lab: optionality, identifying status, and actions.
         if table.foreignKeys:
             html_content += """                    <div class="relationships-section">
-                        <strong>🔗 Foreign Key Relationships</strong>
+                        <strong>References (outgoing foreign keys)</strong>
 """
             for fk in table.foreignKeys:
                 source_cols = ', '.join([col.name for col in fk.columns])
                 ref_cols = ', '.join([col.name for col in fk.referencedColumns])
+                optionality = ('Required' if all(effective_not_null(table, col)
+                                                  for col in fk.columns)
+                               else 'Optional')
+                identifying = ('Identifying' if any(table.isPrimaryKeyColumn(col)
+                                                     for col in fk.columns)
+                               else 'Non-identifying')
+                delete_rule = getattr(fk, 'deleteRule', '') or 'NO ACTION'
+                update_rule = getattr(fk, 'updateRule', '') or 'NO ACTION'
                 html_content += f"""                        <div class="relationship-item">
-                            {escape_html(source_cols)} → {escape_html(fk.referencedTable.name)}.{escape_html(ref_cols)}
-                            <span style="color: #6b7280; font-size: 0.8125rem; margin-left: 12px;">({escape_html(fk.name)})</span>
+                            <strong>{escape_html(source_cols)}</strong> → {escape_html(fk.referencedTable.name)}.{escape_html(ref_cols)}
+                            <span style="color: #4b5563; font-size: 0.8125rem; margin-left: 12px;">
+                                {escape_html(fk.name)} · {optionality} · {identifying} ·
+                                ON DELETE {escape_html(delete_rule)} · ON UPDATE {escape_html(update_rule)}
+                            </span>
+                        </div>
+"""
+            html_content += """                    </div>
+"""
+
+        incoming = incoming_relationships.get(table.name, [])
+        if incoming:
+            html_content += """                    <div class="relationships-section incoming-relationships">
+                        <strong>Referenced by (incoming foreign keys)</strong>
+"""
+            for source_table, fk in incoming:
+                source_cols = ', '.join(col.name for col in fk.columns)
+                ref_cols = ', '.join(col.name for col in fk.referencedColumns)
+                html_content += f"""                        <div class="relationship-item">
+                            <strong>{escape_html(source_table.name)}.{escape_html(source_cols)}</strong>
+                            → {escape_html(table.name)}.{escape_html(ref_cols)}
+                            <span style="color: #4b5563; font-size: 0.8125rem; margin-left: 12px;">
+                                {escape_html(fk.name)}
+                            </span>
+                        </div>
+"""
+            html_content += """                    </div>
+"""
+
+        checks = table_checks(table)
+        if checks:
+            html_content += """                    <div class="indexes-section">
+                        <strong>Check constraints</strong>
+"""
+            for position, check in enumerate(checks, 1):
+                expression = check_expression(check)
+                if expression:
+                    html_content += f"""                        <div class="index-item">
+                            <span style="font-weight: 700;">{escape_html(check_name(check, position))}</span>
+                            <code>{escape_html(expression)}</code>
                         </div>
 """
             html_content += """                    </div>
@@ -2402,7 +2967,7 @@ def generate_html_content(schema, config):
 """
 
         html_content += """                </div>
-            </div>
+            </section>
 """
 
     # Close HTML and add JavaScript with DDL modal if configured
@@ -2410,53 +2975,89 @@ def generate_html_content(schema, config):
     if config.get('generate_ddl', True):
         ddl_modal_html = """
     <!-- DDL Modal -->
-    <div id="ddlModal" class="ddl-modal">
-        <div class="ddl-content">
+    <div id="ddlModal" class="ddl-modal" role="dialog" aria-modal="true" aria-labelledby="ddlModalTitle" aria-describedby="ddlModalNote">
+        <div class="ddl-content" tabindex="-1">
             <div class="ddl-header">
-                <h3>Table DDL Statement</h3>
-                <button class="btn-close" onclick="closeDDL()">✕ Close</button>
+                <h3 id="ddlModalTitle">Reference DDL</h3>
+                <button type="button" class="btn-close" onclick="closeDDL()">Close</button>
             </div>
+            <p id="ddlModalNote" style="margin-bottom: 16px; color: #4b5563;">
+                Reconstructed from Workbench model metadata. Compare it with
+                <code>SHOW CREATE TABLE</code> before executing it.
+            </p>
             <pre id="ddlCode" class="ddl-code"></pre>
             <div style="margin-top: 24px; text-align: right;">
-                <button class="export-btn" style="background: var(--primary); color: white; border: none; font-weight: 600;" onclick="copyDDL()">📋 Copy to Clipboard</button>
+                <button type="button" class="export-btn" style="background: var(--primary); color: white; border: none; font-weight: 600;" onclick="copyDDL()">Copy to clipboard</button>
             </div>
         </div>
     </div>"""
 
     html_content += f"""        </div>
-    </div>
+    </main>
 
     {ddl_modal_html}
 
     <!-- Toast Notification -->
-    <div id="toast" class="toast">✓ Operation successful!</div>
+    <div id="toast" class="toast" role="status" aria-live="polite">Operation successful.</div>
 
-    <a href="#" onclick="scrollToTop(); return false;" class="back-to-top">↑</a>
+    <a href="#main-content" onclick="scrollToTop();" class="back-to-top" aria-label="Back to top" aria-hidden="true" tabindex="-1">↑</a>
 
-    <script>
-        // DDL Scripts Storage
-        const ddlScripts = {json.dumps(ddl_scripts) if config.get('generate_ddl', True) else '{}'};
-
-        // Schema Data for Export
-        const schemaData = {json.dumps({
+    <script id="ddlData" type="application/json">{safe_json_for_html(ddl_scripts if config.get('generate_ddl', True) else {})}</script>
+    <script id="schemaDataJson" type="application/json">{safe_json_for_html({
             'name': schema.name,
             'generated': generation_time,
             'statistics': stats,
             'tables': [
                 {
-                    
-                    
+                    'name': table.name,
                     'comment': table.comment if table.comment else None,
+                    'engine': getattr(table, 'tableEngine', '') or None,
+                    'checks': [
+                        {
+                            'name': check_name(check, position),
+                            'expression': check_expression(check)
+                        }
+                        for position, check in enumerate(table_checks(table), 1)
+                        if check_expression(check)
+                    ],
+                    'indexes': [
+                        {
+                            'name': index.name,
+                            'columns': [index_column_name(item) for item in index.columns],
+                            'unique': bool(getattr(index, 'unique', False)),
+                            'primary': bool(getattr(index, 'isPrimary', False))
+                                       or getattr(index, 'name', '').upper() == 'PRIMARY',
+                            'type': getattr(index, 'indexType', '') or None
+                        }
+                        for index in table.indices
+                    ],
                     'columns': [
                         {
                             'name': col.name,
                             'type': col.formattedType,
-                            'nullable': col.isNotNull == 0,
-                            'default': col.defaultValue,
+                            'nullable': not effective_not_null(table, col),
+                            'default': display_default(table, col),
                             'comment': col.comment if col.comment else None,
                             'is_primary_key': table.isPrimaryKeyColumn(col),
                             'is_foreign_key': table.isForeignKeyColumn(col),
-                            'auto_increment': col.autoIncrement if hasattr(col, 'autoIncrement') else False
+                            'auto_increment': col.autoIncrement if hasattr(col, 'autoIncrement') else False,
+                            'generated': bool(getattr(col, 'generated', False)),
+                            'generated_expression': (
+                                getattr(col, 'generatedExpression', '') or
+                                getattr(col, 'expression', '') or None
+                            ),
+                            'generated_storage': getattr(col, 'generatedStorage', '') or None,
+                            'unique_groups': [
+                                index.name for index in table.indices
+                                if getattr(index, 'unique', False)
+                                and not getattr(index, 'isPrimary', False)
+                                and getattr(index, 'name', '').upper() != 'PRIMARY'
+                                and index_contains_column(index, col)
+                            ],
+                            'foreign_keys': [
+                                fk.name for fk in table.foreignKeys
+                                if any(member.name == col.name for member in fk.columns)
+                            ]
                         } for col in table.columns
                     ],
                     'foreign_keys': [
@@ -2464,33 +3065,64 @@ def generate_html_content(schema, config):
                             'name': fk.name,
                             'columns': [col.name for col in fk.columns],
                             'referenced_table': fk.referencedTable.name,
-                            'referenced_columns': [col.name for col in fk.referencedColumns]
+                            'referenced_columns': [col.name for col in fk.referencedColumns],
+                            'delete_rule': getattr(fk, 'deleteRule', ''),
+                            'update_rule': getattr(fk, 'updateRule', ''),
+                            'required': all(effective_not_null(table, col)
+                                            for col in fk.columns),
+                            'identifying': any(table.isPrimaryKeyColumn(col) for col in fk.columns)
                         } for fk in table.foreignKeys
+                    ],
+                    'incoming_foreign_keys': [
+                        {
+                            'name': fk.name,
+                            'source_table': source_table.name,
+                            'columns': [col.name for col in fk.columns],
+                            'referenced_columns': [col.name for col in fk.referencedColumns],
+                            'delete_rule': getattr(fk, 'deleteRule', ''),
+                            'update_rule': getattr(fk, 'updateRule', ''),
+                            'required': all(effective_not_null(source_table, col)
+                                            for col in fk.columns),
+                            'identifying': any(source_table.isPrimaryKeyColumn(col)
+                                               for col in fk.columns)
+                        }
+                        for source_table, fk in incoming_relationships.get(table.name, [])
                     ]
                 } for table in schema.tables
             ]
-        }, default=str)};
+        })}</script>
+
+    <script>
+        const ddlScripts = JSON.parse(document.getElementById('ddlData').textContent);
+        const schemaData = JSON.parse(document.getElementById('schemaDataJson').textContent);
 
         // Debounced search
         let searchTimeout;
+        let activeTableFilter = 'all';
         function searchWithDebounce() {{
             clearTimeout(searchTimeout);
             searchTimeout = setTimeout(searchTables, 300);
         }}
 
         function searchTables() {{
+            applyTableVisibility();
+        }}
+
+        function applyTableVisibility() {{
             const searchTerm = document.getElementById('searchBox').value.toLowerCase();
             const tables = document.querySelectorAll('.table-wrapper');
-            let visibleCount = 0;
 
             tables.forEach(table => {{
                 const tableContent = table.textContent.toLowerCase();
-                if (searchTerm === '' || tableContent.includes(searchTerm)) {{
-                    table.style.display = 'block';
-                    visibleCount++;
-                }} else {{
-                    table.style.display = 'none';
-                }}
+                const outgoing = Number.parseInt(table.dataset.fkCount || '0', 10);
+                const incoming = Number.parseInt(table.dataset.incomingFkCount || '0', 10);
+                const matchesSearch = searchTerm === '' || tableContent.includes(searchTerm);
+                const matchesFilter =
+                    activeTableFilter === 'all' ||
+                    (activeTableFilter === 'child' && outgoing > 0) ||
+                    (activeTableFilter === 'referenced' && incoming > 0) ||
+                    (activeTableFilter === 'isolated' && outgoing === 0 && incoming === 0);
+                table.style.display = matchesSearch && matchesFilter ? 'block' : 'none';
             }});
 
             // Update TOC items visibility
@@ -2503,41 +3135,30 @@ def generate_html_content(schema, config):
         }}
 
         function filterTables(filter) {{
-            const tables = document.querySelectorAll('.table-wrapper');
             const buttons = document.querySelectorAll('.filter-btn');
+            activeTableFilter = filter;
 
             // Update button states
             buttons.forEach(btn => {{
                 btn.classList.remove('active');
+                if (btn.dataset.filter) btn.setAttribute('aria-pressed', 'false');
             }});
 
-            // Find and activate the right button
-            buttons.forEach(btn => {{
-                if ((filter === 'all' && btn.textContent === 'All Tables') ||
-                    (filter === 'has-fk' && btn.textContent === 'Has FK') ||
-                    (filter === 'no-fk' && btn.textContent === 'No FK')) {{
-                    btn.classList.add('active');
-                }}
-            }});
+            const activeButton = document.querySelector(`.filter-btn[data-filter="${{filter}}"]`);
+            if (activeButton) {{
+                activeButton.classList.add('active');
+                activeButton.setAttribute('aria-pressed', 'true');
+            }}
 
-            // Filter tables
-            tables.forEach(table => {{
-                const fkCount = parseInt(table.dataset.fkCount);
-                if (filter === 'all') {{
-                    table.style.display = 'block';
-                }} else if (filter === 'has-fk' && fkCount > 0) {{
-                    table.style.display = 'block';
-                }} else if (filter === 'no-fk' && fkCount === 0) {{
-                    table.style.display = 'block';
-                }} else {{
-                    table.style.display = 'none';
-                }}
-            }});
+            applyTableVisibility();
         }}
 
         function toggleTable(tableId) {{
             const table = document.getElementById(tableId);
+            if (!table) return;
             table.classList.toggle('collapsed');
+            const toggle = table.querySelector('.table-toggle');
+            if (toggle) toggle.setAttribute('aria-expanded', String(!table.classList.contains('collapsed')));
         }}
 
         function toggleAllTables() {{
@@ -2550,18 +3171,50 @@ def generate_html_content(schema, config):
                 }} else {{
                     table.classList.add('collapsed');
                 }}
+                const toggle = table.querySelector('.table-toggle');
+                if (toggle) toggle.setAttribute('aria-expanded', String(allCollapsed));
             }});
         }}
 
+        let lastFocusedElement = null;
         function showDDL(tableName) {{
             const modal = document.getElementById('ddlModal');
             const code = document.getElementById('ddlCode');
+            if (!modal || !code) return;
+            lastFocusedElement = document.activeElement;
             code.textContent = ddlScripts[tableName] || 'DDL not available';
             modal.classList.add('show');
+            document.getElementById('main-content')?.setAttribute('inert', '');
+            document.querySelector('.back-to-top')?.setAttribute('inert', '');
+            modal.querySelector('.btn-close').focus();
         }}
 
         function closeDDL() {{
-            document.getElementById('ddlModal').classList.remove('show');
+            const modal = document.getElementById('ddlModal');
+            if (!modal) return;
+            modal.classList.remove('show');
+            document.getElementById('main-content')?.removeAttribute('inert');
+            document.querySelector('.back-to-top')?.removeAttribute('inert');
+            if (lastFocusedElement) lastFocusedElement.focus();
+        }}
+
+        function trapDDLFocus(event) {{
+            const modal = document.getElementById('ddlModal');
+            if (!modal?.classList.contains('show') || event.key !== 'Tab') return;
+            const focusable = Array.from(modal.querySelectorAll(
+                'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), ' +
+                'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+            )).filter(element => element.offsetParent !== null);
+            if (!focusable.length) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) {{
+                event.preventDefault();
+                last.focus();
+            }} else if (!event.shiftKey && document.activeElement === last) {{
+                event.preventDefault();
+                first.focus();
+            }}
         }}
 
         function copyDDL() {{
@@ -2590,32 +3243,73 @@ def generate_html_content(schema, config):
         }}
 
         function printToPDF() {{
-            // Prepare page for printing
             document.body.classList.add('printing');
+            const collapsedBeforePrint = Array.from(
+                document.querySelectorAll('.table-wrapper.collapsed')
+            );
+            collapsedBeforePrint.forEach(table => table.classList.remove('collapsed'));
 
-            // Expand all collapsed tables before printing
-            const tables = document.querySelectorAll('.table-wrapper.collapsed');
-            tables.forEach(table => {{
-                table.classList.remove('collapsed');
-            }});
+            const restorePrintState = () => {{
+                collapsedBeforePrint.forEach(table => table.classList.add('collapsed'));
+                document.body.classList.remove('printing');
+            }};
+            window.addEventListener('afterprint', restorePrintState, {{ once: true }});
+            window.print();
+            showToast('Choose “Save as PDF” in the print dialog.');
+        }}
 
-            // Give browser time to render changes
-            setTimeout(() => {{
-                window.print();
+        function csvCell(value) {{
+            let text = value === null || value === undefined ? '' : String(value);
+            if (/^[\\t\\r\\n ]*[=+\\-@]/.test(text)) text = "'" + text;
+            return '"' + text.replace(/"/g, '""') + '"';
+        }}
 
-                // Restore collapsed state after printing
-                setTimeout(() => {{
-                    document.body.classList.remove('printing');
-                }}, 1000);
-            }}, 100);
+        function safeFilePart(value) {{
+            const cleaned = String(value || 'schema')
+                .replace(/[^a-zA-Z0-9._-]+/g, '_')
+                .replace(/^_+|_+$/g, '');
+            return cleaned || 'schema';
+        }}
 
-            // Show instructions
-            showToast('Print dialog opening. Select "Save as PDF" in the printer options.');
+        function downloadBlob(blob, filename) {{
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 0);
         }}
 
         function exportToCSV() {{
-            let csv = 'Table,Column,Type,Nullable,Primary Key,Foreign Key,Default,Auto Increment,Comment\\n';
+            const rows = [[
+                'Table', 'Column', 'Type', 'Nullable', 'Primary Key',
+                'Foreign Key', 'Default', 'Auto Increment', 'Generated',
+                'Generated Expression', 'Generated Storage', 'Unique Groups',
+                'FK Constraints', 'Outgoing FK Details', 'Incoming FK Details',
+                'Engine', 'Table Checks', 'Comment'
+            ]];
             schemaData.tables.forEach(table => {{
+                const tableChecks = (table.checks || [])
+                    .map(check => `${{check.name}}: ${{check.expression}}`)
+                    .join('; ');
+                const outgoingDetails = (table.foreign_keys || []).map(fk =>
+                    `${{fk.name}}: (${{fk.columns.join(', ')}}) -> ` +
+                    `${{fk.referenced_table}}(${{fk.referenced_columns.join(', ')}}); ` +
+                    `${{fk.required ? 'required' : 'optional'}}; ` +
+                    `${{fk.identifying ? 'identifying' : 'non-identifying'}}; ` +
+                    `ON DELETE ${{fk.delete_rule || 'NO ACTION'}}; ` +
+                    `ON UPDATE ${{fk.update_rule || 'NO ACTION'}}`
+                ).join(' | ');
+                const incomingDetails = (table.incoming_foreign_keys || []).map(fk =>
+                    `${{fk.name}}: ${{fk.source_table}}(${{fk.columns.join(', ')}}) -> ` +
+                    `${{table.name}}(${{fk.referenced_columns.join(', ')}}); ` +
+                    `${{fk.required ? 'required' : 'optional'}}; ` +
+                    `${{fk.identifying ? 'identifying' : 'non-identifying'}}; ` +
+                    `ON DELETE ${{fk.delete_rule || 'NO ACTION'}}; ` +
+                    `ON UPDATE ${{fk.update_rule || 'NO ACTION'}}`
+                ).join(' | ');
                 table.columns.forEach(col => {{
                     const nullable = col.nullable ? 'YES' : 'NO';
                     const isPK = col.is_primary_key ? 'YES' : 'NO';
@@ -2623,24 +3317,27 @@ def generate_html_content(schema, config):
                     const autoInc = col.auto_increment ? 'YES' : 'NO';
                     const defaultVal = col.default || '';
                     const comment = col.comment || '';
-                    csv += `"${{table.name}}","${{col.name}}","${{col.type}}","${{nullable}}","${{isPK}}","${{isFK}}","${{defaultVal}}","${{autoInc}}","${{comment}}"\\n`;
+                    rows.push([
+                        table.name, col.name, col.type, nullable, isPK, isFK,
+                        defaultVal, autoInc, col.generated ? 'YES' : 'NO',
+                        col.generated_expression || '', col.generated_storage || '',
+                        (col.unique_groups || []).join('; '),
+                        (col.foreign_keys || []).join('; '),
+                        outgoingDetails, incomingDetails, table.engine || '',
+                        tableChecks, comment
+                    ]);
                 }});
             }});
 
-            const blob = new Blob([csv], {{ type: 'text/csv;charset=utf-8;' }});
-            const link = document.createElement('a');
-            link.href = URL.createObjectURL(blob);
-            link.download = `data_dictionary_${{schemaData.name}}_${{Date.now()}}.csv`;
-            link.click();
+            const csv = '\\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\\r\\n') + '\\r\\n';
+            const blob = new Blob([csv], {{ type: 'text/csv;charset=utf-8' }});
+            downloadBlob(blob, `data_dictionary_${{safeFilePart(schemaData.name)}}.csv`);
             showToast('CSV exported successfully!');
         }}
 
         function exportToJSON() {{
             const blob = new Blob([JSON.stringify(schemaData, null, 2)], {{ type: 'application/json' }});
-            const link = document.createElement('a');
-            link.href = URL.createObjectURL(blob);
-            link.download = `data_dictionary_${{schemaData.name}}_${{Date.now()}}.json`;
-            link.click();
+            downloadBlob(blob, `data_dictionary_${{safeFilePart(schemaData.name)}}.json`);
             showToast('JSON exported successfully!');
         }}
 
@@ -2649,10 +3346,28 @@ def generate_html_content(schema, config):
             return false;
         }}
 
+        function updateBackToTop() {{
+            const button = document.querySelector('.back-to-top');
+            if (!button) return;
+            const visible = window.scrollY > 600;
+            button.classList.toggle('visible', visible);
+            button.setAttribute('aria-hidden', String(!visible));
+            button.setAttribute('tabindex', visible ? '0' : '-1');
+        }}
+
+        window.addEventListener('scroll', updateBackToTop, {{ passive: true }});
+        updateBackToTop();
+
         // Close modal on escape or click outside
         document.addEventListener('keydown', function(e) {{
+            trapDDLFocus(e);
             if (e.key === 'Escape') {{
-                closeDDL();
+                const wrapper = document.getElementById('erdWrapper');
+                if (wrapper && wrapper.classList.contains('fullscreen')) {{
+                    toggleERDFullscreen();
+                }} else {{
+                    closeDDL();
+                }}
             }}
         }});
 
@@ -2696,10 +3411,19 @@ def generate_html_content(schema, config):
                    caption="Generate Data Dictionary with ERD",
                    description="Generate high-contrast HTML data dictionary with relationship visualization",
                    input=[wbinputs.currentCatalog()],
-                   pluginMenu="Catalog")
+                   pluginMenu="Catalog",
+                   accessibilityName="Generate Data Dictionary with ERD")
 @ModuleInfo.export(grt.INT, grt.classes.db_Catalog)
 def generateDataDictionary(catalog):
     """Main plugin function called from menu"""
+
+    if not catalog or not getattr(catalog, 'schemata', None):
+        mforms.Utilities.show_warning(
+            "No model schema",
+            "Open a Workbench model that contains at least one schema, then run the plugin again.",
+            "OK", "", ""
+        )
+        return 0
 
     # Create dialog for schema selection
     dialog = SchemaSelectionDialog(catalog)
@@ -2716,13 +3440,39 @@ def generateDataDictionary(catalog):
         mforms.Utilities.show_error("Error", "No schema selected or output path not specified", "OK", "", "")
         return 0
 
+    output_path = os.path.abspath(os.path.expanduser(output_path))
+    output_directory = os.path.dirname(output_path)
+    if not os.path.isdir(output_directory):
+        mforms.Utilities.show_error(
+            "Invalid folder",
+            f"The output folder does not exist:\n{output_directory}",
+            "OK", "", ""
+        )
+        return 0
+
+    if os.path.exists(output_path):
+        replace_result = mforms.Utilities.show_message(
+            "Replace existing file?",
+            f"A file already exists at:\n{output_path}\n\nReplace it?",
+            "Replace", "Cancel", ""
+        )
+        if replace_result != mforms.ResultOk:
+            return 0
+
+    temporary_path = None
     try:
         # Generate HTML content with ERD
         html_content = generate_html_content(selected_schema, config)
 
-        # Write to file
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(html_content)
+        # Write in the destination folder, then atomically replace the target so
+        # an interrupted generation cannot leave a half-written report.
+        with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', dir=output_directory,
+                prefix='.data_dictionary_', suffix='.tmp', delete=False) as output_file:
+            temporary_path = output_file.name
+            output_file.write(html_content)
+        os.replace(temporary_path, output_path)
+        temporary_path = None
 
         # Show success message with options
         result = mforms.Utilities.show_message("Success",
@@ -2730,15 +3480,20 @@ def generateDataDictionary(catalog):
             "Open File", "OK", "")
 
         if result == mforms.ResultOk:
-            # Try to open the file in default browser
             import webbrowser
-            webbrowser.open(f"file://{output_path}")
+            webbrowser.open(Path(output_path).resolve().as_uri())
 
         return 1
 
     except Exception as e:
         mforms.Utilities.show_error("Error", f"Failed to generate data dictionary:\n{str(e)}", "OK", "", "")
         return 0
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
 
 class SchemaSelectionDialog:
     """Dialog for selecting schema and output options"""
@@ -2751,7 +3506,7 @@ class SchemaSelectionDialog:
 
         # Create form
         self.form = mforms.Form(None, mforms.FormDialogFrame)
-        self.form.set_title("Generate Data Dictionary with ERD - Version 3.5")
+        self.form.set_title("Generate Data Dictionary with ERD - Version 3.7")
 
         # Create main box
         box = mforms.newBox(False)
@@ -2759,7 +3514,7 @@ class SchemaSelectionDialog:
         box.set_spacing(15)
 
         # Title
-        title_label = mforms.newLabel("Data Dictionary Generator v3.5 - With Relationship Visualization")
+        title_label = mforms.newLabel("Data Dictionary Generator v3.7")
         title_label.set_style(mforms.BigBoldStyle)
         box.add(title_label, False, False)
 
@@ -2772,10 +3527,22 @@ class SchemaSelectionDialog:
         box.add(schema_label, False, False)
 
         self.schema_selector = mforms.newSelector()
-        for schema in catalog.schemata:
-            self.schema_selector.add_item(schema.name)
+        preferred_index = None
+        default_schema = getattr(catalog, 'defaultSchema', None)
+        default_name = (getattr(default_schema, 'name', '') or
+                        (default_schema if isinstance(default_schema, str) else ''))
+        for index, schema in enumerate(catalog.schemata):
+            self.schema_selector.add_item(
+                f"{schema.name} — {len(schema.tables)} table"
+                f"{'s' if len(schema.tables) != 1 else ''}"
+            )
+            if (schema == default_schema or schema.name == default_name) and schema.tables:
+                preferred_index = index
+            elif preferred_index is None and schema.tables:
+                preferred_index = index
         if catalog.schemata:
-            self.schema_selector.set_selected(0)
+            self.schema_selector.set_selected(preferred_index if preferred_index is not None else 0)
+        self.schema_selector.set_name("Database schema")
         box.add(self.schema_selector, False, False)
 
         # Add separator
@@ -2810,7 +3577,7 @@ class SchemaSelectionDialog:
         left_options.add(self.include_comments_cb, False, False)
 
         self.generate_ddl_cb = mforms.newCheckBox()
-        self.generate_ddl_cb.set_text("Generate DDL Statements")
+        self.generate_ddl_cb.set_text("Include reconstructed reference DDL")
         self.generate_ddl_cb.set_active(self.config['generate_ddl'])
         left_options.add(self.generate_ddl_cb, False, False)
 
@@ -2821,17 +3588,17 @@ class SchemaSelectionDialog:
         right_options.set_spacing(8)
 
         self.include_views_cb = mforms.newCheckBox()
-        self.include_views_cb.set_text("Include Views")
+        self.include_views_cb.set_text("Count Views")
         self.include_views_cb.set_active(self.config['include_views'])
         right_options.add(self.include_views_cb, False, False)
 
         self.include_triggers_cb = mforms.newCheckBox()
-        self.include_triggers_cb.set_text("Include Triggers")
+        self.include_triggers_cb.set_text("List Triggers")
         self.include_triggers_cb.set_active(self.config['include_triggers'])
         right_options.add(self.include_triggers_cb, False, False)
 
         self.include_routines_cb = mforms.newCheckBox()
-        self.include_routines_cb.set_text("Include Stored Routines")
+        self.include_routines_cb.set_text("Count Stored Routines")
         self.include_routines_cb.set_active(self.config['include_routines'])
         right_options.add(self.include_routines_cb, False, False)
 
@@ -2840,9 +3607,10 @@ class SchemaSelectionDialog:
         right_options.add(layout_label, False, False)
 
         self.layout_selector = mforms.newSelector()
-        self.layout_selector.add_item("Force-Directed")
-        self.layout_selector.add_item("Hierarchical")
+        self.layout_selector.add_item("Balanced grid (recommended)")
+        self.layout_selector.add_item("Parent-to-child hierarchy")
         self.layout_selector.set_selected(0)
+        self.layout_selector.set_name("ERD layout")
         right_options.add(self.layout_selector, False, False)
 
         options_box.add(right_options, True, True)
@@ -2862,6 +3630,7 @@ class SchemaSelectionDialog:
 
         self.output_entry = mforms.newTextEntry()
         self.output_entry.set_value(os.path.join(os.path.expanduser("~"), "data_dictionary.html"))
+        self.output_entry.set_name("Output file")
         file_box.add(self.output_entry, True, True)
 
         browse_button = mforms.newButton()
@@ -2881,15 +3650,17 @@ class SchemaSelectionDialog:
         # Add spacer
         button_box.add(mforms.newLabel(""), True, True)
 
-        cancel_button = mforms.newButton()
-        cancel_button.set_text("Cancel")
-        cancel_button.add_clicked_callback(self.cancel_clicked)
-        button_box.add(cancel_button, False, False)
+        self.cancel_button = mforms.newButton()
+        self.cancel_button.set_text("Cancel")
+        self.cancel_button.set_name("Cancel")
+        self.cancel_button.add_clicked_callback(self.cancel_clicked)
+        button_box.add(self.cancel_button, False, False)
 
-        ok_button = mforms.newButton()
-        ok_button.set_text("Generate")
-        ok_button.add_clicked_callback(self.ok_clicked)
-        button_box.add(ok_button, False, False)
+        self.ok_button = mforms.newButton()
+        self.ok_button.set_text("Generate")
+        self.ok_button.set_name("Generate")
+        self.ok_button.add_clicked_callback(self.ok_clicked)
+        button_box.add(self.ok_button, False, False)
 
         box.add(button_box, False, False)
 
@@ -2904,16 +3675,33 @@ class SchemaSelectionDialog:
 
         if filechooser.run_modal():
             path = filechooser.get_path()
-            if not path.endswith('.html'):
+            if not path.lower().endswith('.html'):
                 path += '.html'
             self.output_entry.set_value(path)
 
     def ok_clicked(self):
         """Handle OK button click"""
         selected_index = self.schema_selector.get_selected_index()
+        if selected_index < 0:
+            mforms.Utilities.show_warning(
+                "Select a schema", "Choose a database schema before generating.",
+                "OK", "", ""
+            )
+            return
         if selected_index >= 0:
             self.selected_schema = self.catalog.schemata[selected_index]
+            if not self.selected_schema.tables:
+                mforms.Utilities.show_warning(
+                    "Empty schema",
+                    f"{self.selected_schema.name} has no tables. Select a schema "
+                    "that contains model tables before generating the report.",
+                    "OK", "", ""
+                )
+                self.selected_schema = None
+                return
             self.output_path = self.output_entry.get_string_value()
+            if self.output_path and not self.output_path.lower().endswith('.html'):
+                self.output_path += '.html'
 
             # Update configuration
             self.config['show_relationship_diagram'] = self.show_erd_cb.get_active()
@@ -2939,5 +3727,5 @@ class SchemaSelectionDialog:
 
     def run(self):
         """Show dialog and wait for user interaction"""
-        self.form.run_modal(None, None)
+        self.form.run_modal(self.ok_button, self.cancel_button)
         return self.selected_schema is not None and self.output_path is not None

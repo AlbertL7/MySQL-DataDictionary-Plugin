@@ -1,186 +1,129 @@
-# MySQL-DataDictionary-Plugin
-MySQL Workbench plugin that generates interactive HTML data dictionaries with searchable tables, columns, and visual ERD diagrams
+# MySQL Workbench Data Dictionary Plugin
 
-[![MySQL](https://img.shields.io/badge/MySQL-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
-[![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Generate a self-contained HTML data dictionary from the **catalog in the MySQL
+Workbench model that is currently open**. The report is designed for students:
+it starts with totals and a short reading guide, then provides an ERD, a table
+finder, and one expandable detail section per table.
 
-A powerful MySQL Workbench plugin that automatically generates beautiful, interactive HTML data dictionaries with intelligent Entity Relationship Diagrams (ERD). Perfect for database documentation, team collaboration, and project presentations.
+The plugin does not send schema data to a web service and the generated report
+does not load external JavaScript, fonts, or analytics.
 
-## ✨ Features
+## What version 3.7 documents
 
-### 📊 Interactive ERD Diagram
-- **Visual relationship mapping** with curved connector lines
-- **Intelligent label positioning** with collision detection and avoidance
-- **Hierarchical or force-directed layouts** for optimal table placement
-- **Zoom, pan, and fullscreen** controls for easy navigation
-- **Click-to-navigate** from diagram to table details
+- Tables, columns, data types, nullability, defaults, comments, and generated columns
+- Primary keys, single-column unique keys, composite unique groups, and indexes
+- Both sides of each foreign key: **references** and **referenced by**
+- Foreign-key optionality, identifying status, and `ON DELETE` / `ON UPDATE` actions
+- Check constraints and triggers when Workbench exposes them in the model catalog
+- Counts for tables, columns, foreign keys, indexes, views, routines, and triggers
+- A searchable table list, foreign-key filters, an interactive SVG ERD, CSV/JSON export, and print/PDF styling
+- Reconstructed reference DDL with identifiers, indexes, checks, generated expressions, foreign-key actions, comments, and storage engine
 
-### 🔍 Advanced Search & Filtering
-- **Real-time search** with debouncing across tables, columns, and comments
-- **Highlighted search results** with yellow background for easy visibility
-- **Filter by foreign keys** - View tables with or without FKs
-- **Table of Contents** with live filtering and quick navigation
+> **Important:** “Reference DDL” is reconstructed from the metadata Workbench
+> exposes to plugins. Compare it with `SHOW CREATE TABLE table_name;` before
+> executing it. The data dictionary is documentation, not a migration tool.
 
-### 📝 Comprehensive Documentation
-- **Complete schema overview** with statistics (tables, columns, PKs, FKs)
-- **Detailed table information** including:
-  - Column definitions with data types, constraints, and defaults
-  - Primary and Foreign Key relationships
-  - Indexes and constraints
-  - Table comments and column descriptions
-- **Export functionality** - Download as CSV for offline analysis
-- **Print-optimized styling** for professional documentation
+## Before you install it
 
-### 🎨 Modern UI/UX
-- Clean, responsive design with smooth animations
-- Color-coded elements (PKs in red, FKs in blue)
-- Expandable/collapsible sections
-- Dark mode compatible table headers
-- Mobile-friendly layout
+- MySQL Workbench 8.0 with Python plugin support
+- An EER model/catalog loaded in Workbench
+- No `pip` packages or separate API keys
 
-## 📸 Screenshots
-<img width="1923" height="1461" alt="image" src="https://github.com/user-attachments/assets/b0088409-92d3-4d71-856a-bc92549223e0" />
-<img width="1811" height="1289" alt="image" src="https://github.com/user-attachments/assets/3b4a0001-2063-495a-acc5-05d65e277210" />
-<img width="1795" height="1351" alt="image" src="https://github.com/user-attachments/assets/b4ca61c6-22fd-4098-ba31-bf7163db58c8" />
+This is a **model-catalog plugin**, not a live-query plugin. If the schema exists
+only on a server, use **Database → Reverse Engineer**, select the schema, finish
+the wizard, and save the resulting `.mwb` model first. MySQL server 8.4 features
+can be documented when they are represented in that loaded catalog; the ability
+to connect to or reverse-engineer a particular server version is determined by
+the installed MySQL Workbench version, not by this plugin. Oracle notes that
+Workbench is developed and tested with Server 8.0; it may connect to Server 8.4
+and later, but some Workbench features may not function with those versions.
+See the [current Workbench manual](https://dev.mysql.com/doc/workbench/en/).
 
+A live server connection is not required once the model exists: open the `.mwb`
+file and make its model tab active. If you have only a MySQL create script, use
+**File → Import → Reverse Engineer MySQL Create Script**. Some Workbench releases
+can omit table-level `CHECK` constraints during create-script import, so inspect
+the resulting model and restore any missing checks before generating the report.
+Importing a script into a model does not execute it or create a live database.
 
+## Install
 
-## 🚀 Installation
+1. Download [`DataDictionaryDump.py`](DataDictionaryDump.py). Do not paste it into the SQL editor.
+2. In MySQL Workbench, choose **Scripting → Install Plugin/Module File…** and select the `.py` file.
+3. Restart MySQL Workbench.
+4. Open the `.mwb` model that contains the schema you want to document.
 
-### Prerequisites
-- MySQL Workbench 8.0 or higher
-- Python support enabled in MySQL Workbench
+If the menu wording differs slightly on your operating system, use Workbench’s
+plugin/module installer—not the server administration or SQL editor menus.
 
-### Steps
+## Generate a report
 
-1. **Download the plugin**
-   ```bash
-   https://github.com/AlbertL7/MySQL-DataDictionary-Plugin.git
-   ```
-   - Or you can copy the code and save it as a ".py" file.
+1. Open the `.mwb` model, make its **model tab active**, and confirm the desired schema appears in the model catalog.
+2. Choose **Tools → Catalog → Generate Data Dictionary with ERD**.
+   Some older or platform-specific Workbench builds label the first menu
+   **Plugins** instead of **Tools**.
+   The command may not appear while the Home screen or a SQL Editor tab is active.
+3. Select the schema you want to document.
+4. Leave the ERD, indexes, comments, and reference DDL enabled unless the assignment says otherwise.
+5. Choose an output file and select **Generate**.
+6. If that file already exists, Workbench asks before replacing it.
 
-2. **Open MySQL Workbench**
-  - Go to the scripting tab and select install plugin.
-  - Select the file you saved / downloaded
+The default output is `data_dictionary.html` in your home folder—not necessarily
+the Desktop. The plugin writes through a temporary file so a failed generation
+does not leave a partial report.
 
-4. **Restart MySQL Workbench**
+## Reading the report
 
-5. **Access the plugin**
-   - Open a database model or connection
-   - Go to: **Tools** → **Catalog** → **Generate Data Dictionary with ERD**
+1. Confirm the summary totals.
+2. Use the ERD for the big picture.
+3. Use **Database tables** or search to open one table.
+4. Read **References** for foreign keys owned by that table.
+5. Read **Referenced by** for tables that point to it.
 
-## 📖 Usage
+Compare the report summary with the active Workbench model. Verify the table,
+column, key, relationship, check-constraint, generated-column, and storage-engine
+totals, then spot-check foreign-key optionality and referential actions.
 
-### Basic Usage
+## Security and privacy
 
-1. Open your database in MySQL Workbench
-2. Navigate to **Tools** → **Catalog** → **Generate Data Dictionary with ERD**
-3. Configure your preferences:
-   - Enable/disable ERD diagram
-   - Choose layout type (Hierarchical or Force-Directed)
-   - Select output location
-4. Click **Generate** and wait for completion
-5. The HTML file will open automatically in your default browser
+Version 3.7 treats names, comments, defaults, and other catalog metadata as
+untrusted text. It uses inert JSON blocks, safe DOM IDs, context-appropriate
+escaping, a restrictive Content Security Policy, and formula-safe CSV cells.
+The report remains a local file unless you choose to share it.
 
-### Configuration Options
+Review reports before publishing them: database comments and object names can
+contain business-sensitive information even when no row data is included.
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| **Show Relationship Diagram** | Display interactive ERD | Enabled |
-| **ERD Layout** | Choose between Hierarchical or Force-Directed | Force-Directed |
-| **Output Path** | Location to save the HTML file | Desktop |
+## Known limitations
 
-### Search Tips
+- The plugin documents one selected schema at a time.
+- Cross-schema foreign keys appear in textual table details but are omitted from the ERD because the external table has no node in the selected schema.
+- Views and stored routines are counted; their definitions are not expanded.
+- Workbench catalog objects vary slightly by release. The plugin normalizes both direct and wrapped index-column representations, but an uncommon catalog property may still be absent.
+- Large schemas create large SVG diagrams; search and the table list may be easier to use than the ERD.
+- Reference DDL can only reproduce metadata exposed through the Workbench plugin API.
 
-- **Search by table name**: Type the table name
-- **Search by column**: Enter column name to find all tables containing it
-- **Search by data type**: Search for "VARCHAR", "INT", etc.
-- **Search by comment**: Find tables/columns by their descriptions
-- **Clear search**: Delete search text to show all tables
+## Test locally
 
-### Filter Options
+The test suite uses a representative fake Workbench catalog; it does not need
+MySQL Workbench or a live database.
 
-- **All Tables**: Show all tables in the schema
-- **Has FK**: Show only tables with foreign key relationships
-- **No FK**: Show only tables without foreign keys
+```bash
+python3 -W error::SyntaxWarning -m py_compile DataDictionaryDump.py
+python3 -m unittest discover -s tests -v
+```
 
-## 🛠️ Technical Details
+The tests cover the 12/94/18 acceptance totals, key/action semantics, generated
+and check constraints, DDL reconstruction, export table names, HTML/script
+escaping, CSV defenses, and core accessibility landmarks.
 
-### Technology Stack
-- **Backend**: Python (for MySQL Workbench integration)
-- **Frontend**: Pure HTML5, CSS3, JavaScript (no dependencies)
-- **Graphics**: SVG for ERD rendering
-- **Data Source**: MySQL Workbench GRT (Generic Runtime Type) API
+## Contributing
 
-### Key Features Implementation
+Please keep the plugin dependency-free and compatible with Workbench’s embedded
+Python runtime. Add or update a fake-catalog regression test for behavior changes.
 
-#### Collision Detection Algorithm
-The plugin uses a sophisticated multi-pass algorithm to prevent FK label overlaps (May miss some fk labels in the ERD):
-1. **Pass 1**: Calculate all relationship data and initial positions
-2. **Pass 2**: Try 14+ different positions for each label to find collision-free placement
-3. **Pass 3**: Render all relationships with optimized label positions
+## License
 
-#### Search Highlighting
-- TreeWalker API for efficient DOM traversal
-- Regex-free text matching for better performance
-- Dynamic span injection for highlighted terms
-- Automatic cleanup on new searches
-
-#### Layout Algorithms
-- **Hierarchical**: Tables organized by dependency depth
-- **Force-Directed**: Grid-based layout with optimized spacing
-
-## 🤝 Contributing
-
-Contributions are welcome! Here's how you can help:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-### Development Guidelines
-- Follow PEP 8 style guide for Python code
-- Add comments for complex logic
-- Test with multiple database schemas
-- Update documentation for new features
-
-## 🐛 Known Issues & Limitations
-
-- Cross-schema foreign keys are not displayed in the ERD (by design)
-- Very large schemas (500+ tables) may have performance considerations
-- SVG rendering may vary slightly between browsers
-
-## 📋 Roadmap
-
-- [ ] Add table grouping/clustering in ERD
-- [ ] Support for multiple schema export
-- [ ] Dark mode toggle
-- [ ] Export ERD as PNG/PDF
-- [ ] Custom color themes
-- [ ] Stored procedures and views documentation
-- [ ] Version comparison feature
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Built for MySQL Workbench using the GRT API
-- Inspired by the need for better database documentation tools
-- Thanks to the open-source community for continuous inspiration
-
-## 🌟 Show Your Support
-
-If this plugin helped you, please consider:
-- ⭐ Starring the repository
-- 🐛 Reporting bugs
-- 💡 Suggesting new features
-- 📢 Sharing with others
-
----
-
-**Made with ❤️ for the database community**
+This repository does not currently declare a software license. The repository
+owner should choose and add one before distributing the plugin under explicit
+reuse terms.
